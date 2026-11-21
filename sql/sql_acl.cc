@@ -731,6 +731,8 @@ static HASH acl_roles;
 static HASH acl_roles_mappings;
 static MEM_ROOT acl_memroot, grant_memroot;
 static bool initialized=0;
+static void system_users_free();
+static bool has_auth(LEX_USER *user, LEX *lex);
 static bool allow_all_hosts=1;
 static HASH acl_check_hosts, column_priv_hash, proc_priv_hash, func_priv_hash;
 static HASH package_spec_priv_hash, package_body_priv_hash;
@@ -3751,6 +3753,7 @@ void acl_free(bool end)
     acl_cache->clear(1); /* purecov: inspected */
   else
   {
+    system_users_free();
     plugin_unlock(0, native_password_plugin);
     plugin_unlock(0, old_password_plugin);
     delete acl_cache;
@@ -4942,6 +4945,140 @@ bool acl_check_host(const char *host, const char *ip)
   return 1;					// Host is not allowed
 }
 
+/* Accounts from --system-users; only a system session can manage them. */
+struct System_user { LEX_CSTRING user; LEX_CSTRING host; };
+static char *system_users_buf;
+static System_user *system_users;
+static uint system_users_count;
+
+static void system_users_free()
+{
+  my_free(system_users_buf);
+  my_free(system_users);
+  system_users_buf= 0;
+  system_users= 0;
+  system_users_count= 0;
+}
+
+/* Parse "user@host,user@host"; ASCII, lowercase, no spaces or quotes. */
+bool system_users_init(const char *list)
+{
+  if (!list || !*list)
+    return false;
+
+  size_t len= strlen(list);
+  uint max_count= 1;
+  for (const char *p= list; *p; p++)
+    max_count+= (*p == ',');
+
+  system_users_buf= (char*) my_malloc(PSI_NOT_INSTRUMENTED, len + 1, MYF(MY_WME));
+  system_users= (System_user*) my_malloc(PSI_NOT_INSTRUMENTED,
+                                         max_count * sizeof(System_user),
+                                         MYF(MY_WME));
+  if (!system_users_buf || !system_users)
+  {
+    system_users_free();
+    return true;
+  }
+  memcpy(system_users_buf, list, len + 1);
+
+  for (char *entry= system_users_buf, *next; entry; entry= next)
+  {
+    next= strchr(entry, ',');
+    if (next)
+      *next++= 0;
+
+    char *at= strchr(entry, '@');
+    bool ok= at && at != entry && at[1] && !strchr(at + 1, '@');
+    for (const uchar *p= (const uchar*) entry; ok && *p; p++)
+      ok= *p == '@' ? p == (const uchar*) at :
+          *p > ' ' && *p < 0x7f && !strchr("'\"`", *p) && !(*p >= 'A' && *p <= 'Z');
+    if (!ok)
+    {
+      sql_print_error("Invalid --system-users entry '%s': expected "
+                      "lowercase ASCII user@host without spaces or quotes",
+                      entry);
+      system_users_free();
+      return true;
+    }
+    *at= 0;
+    System_user &su= system_users[system_users_count++];
+    su.user= Lex_cstring_strlen(entry);
+    su.host= Lex_cstring_strlen(at + 1);
+  }
+  return false;
+}
+
+static bool is_system_session(THD *thd)
+{
+  if (thd->bootstrap || thd->slave_thread || IF_WSREP(thd->wsrep_applier, false))
+    return true;
+  for (uint i= 0; i < system_users_count; i++)
+    if (thd->security_ctx->is_priv_user(system_users[i].user,
+                                        system_users[i].host))
+      return true;
+  return false;
+}
+
+/* @return true (with an error) if the account is a system account and the
+   current session is not a system session. */
+static bool system_user_denied(THD *thd, const LEX_CSTRING &user,
+                               const LEX_CSTRING &host)
+{
+  if (!system_users_count || !host.str || !host.length)
+    return false;
+  for (uint i= 0; i < system_users_count; i++)
+  {
+    if (!strcmp(user.str, system_users[i].user.str) &&
+        Lex_ident_host(host).streq(system_users[i].host))
+    {
+      if (is_system_session(thd))
+        return false;
+      my_printf_error(ER_ACCESS_DENIED_ERROR,
+                      "Access denied: '%s'@'%s' is a system account and can "
+                      "only be managed by a system account", MYF(0),
+                      user.str, host.str);
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Check all accounts of an account-management statement; skip_first is for
+   GRANT role, where the first element is the role. */
+bool check_system_users(THD *thd, List<LEX_USER> &list, bool skip_first)
+{
+  if (!system_users_count || !initialized)
+    return false;
+  List_iterator<LEX_USER> it(list);
+  if (skip_first)
+    it++;
+  while (LEX_USER *user= it++)
+  {
+    /* CURRENT_USER/CURRENT_ROLE are the caller itself */
+    if (user->user.str == current_user.str ||
+        user->user.str == current_role.str)
+      continue;
+
+    LEX_CSTRING host= user->host;
+    if (!host.str) // a user without a host, or a role (as in get_current_user)
+    {
+      if (!has_auth(user, thd->lex))
+      {
+        mysql_mutex_lock(&acl_cache->lock);
+        bool is_role= find_acl_role(user->user, false);
+        mysql_mutex_unlock(&acl_cache->lock);
+        if (is_role)
+          continue;
+      }
+      host= host_not_specified;
+    }
+    if (system_user_denied(thd, user->user, host))
+      return true;
+  }
+  return false;
+}
+
 /**
   Check if the user is allowed to alter the mysql.user table
 
@@ -4979,6 +5116,9 @@ static int check_alter_user(THD *thd,
     my_error(ER_PASSWORD_NO_MATCH, MYF(0));
     goto end;
   }
+
+  if (system_user_denied(thd, user, host))
+    goto end;
 
   if (!thd->slave_thread &&
       IF_WSREP((!WSREP(thd) || !thd->wsrep_applier),1) &&
@@ -8966,6 +9106,9 @@ int mysql_table_grant(THD *thd, TABLE_LIST *table_list,
   Lex_ident_table table_name;
   DBUG_ENTER("mysql_table_grant");
 
+  if (check_system_users(thd, user_list))
+    DBUG_RETURN(TRUE);
+
   if (rights & ~TABLE_ACLS)
   {
     my_message(ER_ILLEGAL_GRANT_FOR_TABLE,
@@ -9246,6 +9389,9 @@ bool mysql_routine_grant(THD *thd, TABLE_LIST *table_list,
   const char *db_name, *table_name;
   DBUG_ENTER("mysql_routine_grant");
 
+  if (check_system_users(thd, user_list))
+    DBUG_RETURN(TRUE);
+
   if (rights & ~PROC_ACLS)
   {
     my_message(ER_ILLEGAL_GRANT_FOR_TABLE,
@@ -9440,6 +9586,10 @@ bool mysql_grant_role(THD *thd, List <LEX_USER> &list, bool revoke)
      entries for the command to be valid
    */
   DBUG_ASSERT(list.elements >= 2);
+
+  if (check_system_users(thd, list, true))
+    DBUG_RETURN(TRUE);
+
   int result;
   bool create_new_user, no_auto_create_user;
   String wrong_users;
@@ -9692,6 +9842,9 @@ bool mysql_grant(THD *thd, LEX_CSTRING db, List <LEX_USER> &list,
   bool create_new_users=0;
   int result;
   DBUG_ENTER("mysql_grant");
+
+  if (check_system_users(thd, list))
+    DBUG_RETURN(TRUE);
 
   if (lower_case_table_names && db.str)
   {
@@ -13176,6 +13329,9 @@ bool mysql_create_user(THD *thd, List <LEX_USER> &list, bool handle_as_role)
   DBUG_ENTER("mysql_create_user");
   DBUG_PRINT("entry", ("Handle as %s", handle_as_role ? "role" : "user"));
 
+  if (!handle_as_role && check_system_users(thd, list))
+    DBUG_RETURN(TRUE);
+
   if (handle_as_role && sp_process_definer(thd))
     DBUG_RETURN(TRUE);
 
@@ -13422,6 +13578,9 @@ bool mysql_drop_user(THD *thd, List <LEX_USER> &list, bool handle_as_role)
   DBUG_ENTER("mysql_drop_user");
   DBUG_PRINT("entry", ("Handle as %s", handle_as_role ? "role" : "user"));
 
+  if (!handle_as_role && check_system_users(thd, list))
+    DBUG_RETURN(TRUE);
+
   /* DROP USER may be skipped on replication client. */
   Grant_tables tables;
   const uint tables_to_open= Table_user | Table_db | Table_tables_priv |
@@ -13568,6 +13727,9 @@ bool mysql_rename_user(THD *thd, List <LEX_USER> &list)
   bool some_users_renamed= FALSE;
   DBUG_ENTER("mysql_rename_user");
 
+  if (check_system_users(thd, list))
+    DBUG_RETURN(TRUE);
+
   /* RENAME USER may be skipped on replication client. */
   Grant_tables tables;
   const uint tables_to_open= Table_user | Table_db | Table_tables_priv |
@@ -13667,6 +13829,9 @@ bool mysql_rename_user(THD *thd, List <LEX_USER> &list)
 int mysql_alter_user(THD* thd, List<LEX_USER> &users_list)
 {
   DBUG_ENTER("mysql_alter_user");
+
+  if (check_system_users(thd, users_list))
+    DBUG_RETURN(TRUE);
   int result= 0;
   String wrong_users;
   bool some_users_altered= false;
@@ -13784,6 +13949,9 @@ bool mysql_revoke_all(THD *thd,  List <LEX_USER> &list)
   int result, res;
   ACL_DB *acl_db;
   DBUG_ENTER("mysql_revoke_all");
+
+  if (check_system_users(thd, list))
+    DBUG_RETURN(TRUE);
 
   Grant_tables tables;
   const uint tables_to_open= Table_user | Table_db | Table_tables_priv |
